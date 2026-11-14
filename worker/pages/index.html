@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>CS2 Zero-Budget — Dashboard</title>
+<style>body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem} .card{border:1px solid #ccc;border-radius:8px;padding:1rem;margin:1rem 0} .warn{color:#8a6d00}</style></head>
+<body>
+<h1>CS2 Zero-Budget Dashboard</h1>
+<p class="warn">Research only. No wager placed. Odds shown are <b>model-only fair odds</b> — NO external quote on Cito Free.</p>
+<div class="card"><h2>System health</h2><pre id="health">Loading…</pre></div>
+<div class="card"><h2>Upcoming fixtures</h2><pre id="upcoming">Loading…</pre></div>
+<div class="card"><h2>Predictions (model-only)</h2><pre id="preds">Loading…</pre></div>
+<div class="card"><h2>Quota</h2><pre id="quota">Loading…</pre></div>
+<script>
+async function load(id, path){ try{ const r=await fetch(path); document.getElementById(id).textContent=JSON.stringify(await r.json(),null,2);}catch(e){ document.getElementById(id).textContent="Unavailable: "+e; } }
+load("health","/api/health"); load("upcoming","/api/upcoming"); load("preds","/api/predictions"); load("quota","/api/quota");
+</script>
+</body></html>
