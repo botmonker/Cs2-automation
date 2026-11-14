@@ -1,4 +1,8 @@
-// CS2 Zero-Budget Worker — Phase 3d: + Telegram daily report
+// CS2 Zero-Budget Worker — Phase 3e: batched D1 writes
+// Free tier only. No odds on Free: /api/predictions returns MODEL-ONLY fair odds.
+// Phase 3e fix: syncs did ~300 sequential D1 round-trips and timed out, so all
+// bulk writes now go through env.DB.batch() (chunks of 50) and the results
+// sync reads tracked matches with a single IN query instead of one per item.
 // Free tier only. No odds on Free: /api/predictions returns MODEL-ONLY fair odds.
 // Telegram: Worker sends a daily report to Bosco via the Bot API (free).
 // Secrets needed: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (Cloudflare secrets).
@@ -56,6 +60,21 @@ async function logCall(env, calls = 1) {
   } catch { return null; }
 }
 
+// D1 batch helper: run many prepared statements in a few round-trips.
+// Sequential .run() calls each cost a D1 round-trip (~50-300ms), so a sync
+// doing ~300 of them times out. batch() sends up to 100 statements per call;
+// chunk at 50 to stay well under the limit. Returns total rows changed.
+async function batchRun(env, stmts, chunk = 50) {
+  let changes = 0;
+  for (let i = 0; i < stmts.length; i += chunk) {
+    const part = stmts.slice(i, i + chunk);
+    if (!part.length) continue;
+    const out = await env.DB.batch(part);
+    for (const r of out || []) if (r && r.meta && r.meta.changes) changes += r.meta.changes;
+  }
+  return changes;
+}
+
 // Elo table is created by the Worker itself — no manual SQL step needed.
 async function ensureEloTable(env) {
   await env.DB.prepare(
@@ -67,30 +86,30 @@ async function getEloMap(env) {
   const map = {};
   try {
     await ensureEloTable(env);
-    const { results } = await env.DB.prepare("SELECT team_id, elo, matches_played FROM team_elo").all();
-    for (const r of results) map[r.team_id] = { elo: r.elo, played: r.matches_played };
+    const { results } = await env.DB.prepare("SELECT team_id, elo, matches_played, wins FROM team_elo").all();
+    for (const r of results) map[r.team_id] = { elo: r.elo, played: r.matches_played, wins: r.wins || 0 };
   } catch (e) { /* fall through: all teams default 1500 */ }
   return map;
 }
 
-async function applyEloResult(env, winnerId, loserId, k) {
-  await ensureEloTable(env);
-  const now = new Date().toISOString();
-  const elo = await getEloMap(env);
-  const wElo = (elo[winnerId] && elo[winnerId].elo) || ELO_BASE;
-  const lElo = (elo[loserId] && elo[loserId].elo) || ELO_BASE;
+// Pure Elo move on a shared in-memory map: computes both new ratings, updates
+// the map (so chained results in one run feed forward), and returns the two
+// upsert statements for the caller to batch — no D1 round-trips here.
+function eloMove(env, eloMap, winnerId, loserId, k, now) {
+  const wPrev = eloMap[winnerId] || { elo: ELO_BASE, played: 0, wins: 0 };
+  const lPrev = eloMap[loserId] || { elo: ELO_BASE, played: 0, wins: 0 };
+  const wElo = wPrev.elo, lElo = lPrev.elo;
   const expectedW = eloWinProb(wElo, lElo);
   const newW = Math.round((wElo + k * (1 - expectedW)) * 10) / 10;
   const newL = Math.round((lElo + k * (0 - (1 - expectedW))) * 10) / 10;
-  for (const [tid, newElo, won] of [[winnerId, newW, 1], [loserId, newL, 0]]) {
-    const prev = elo[tid] || { played: 0, wins: 0 };
-    const played = (prev.played || 0) + 1;
-    const wins = (prev.wins || 0) + won;
-    await env.DB.prepare(
-      "INSERT INTO team_elo (team_id, elo, matches_played, wins, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, matches_played=excluded.matches_played, wins=excluded.wins, updated_at=excluded.updated_at"
-    ).bind(tid, newElo, played, wins, now).run();
-  }
-  return { winner_elo_before: wElo, winner_elo_after: newW, loser_elo_before: lElo, loser_elo_after: newL };
+  eloMap[winnerId] = { elo: newW, played: (wPrev.played || 0) + 1, wins: (wPrev.wins || 0) + 1 };
+  eloMap[loserId] = { elo: newL, played: (lPrev.played || 0) + 1, wins: lPrev.wins || 0 };
+  const upsert = "INSERT INTO team_elo (team_id, elo, matches_played, wins, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, matches_played=excluded.matches_played, wins=excluded.wins, updated_at=excluded.updated_at";
+  const stmts = [
+    env.DB.prepare(upsert).bind(winnerId, newW, eloMap[winnerId].played, eloMap[winnerId].wins, now),
+    env.DB.prepare(upsert).bind(loserId, newL, eloMap[loserId].played, eloMap[loserId].wins, now),
+  ];
+  return { winner_elo_before: wElo, winner_elo_after: newW, loser_elo_before: lElo, loser_elo_after: newL, stmts };
 }
 
 // Defensive result extraction: Cito's exact winner/score field names vary by
@@ -204,7 +223,7 @@ async function generatePredictions(env) {
   const { results } = await env.DB.prepare(
     "SELECT id, team1_id, team2_id, best_of FROM matches WHERE status='upcoming' ORDER BY starts_at LIMIT 50"
   ).all();
-  let inserted = 0;
+  const stmts = [];
   for (const m of results) {
     if (!m.team1_id || !m.team2_id) continue;
     const elo1 = (eloMap[m.team1_id] && eloMap[m.team1_id].elo) || ELO_BASE;
@@ -232,12 +251,12 @@ async function generatePredictions(env) {
       }
     }
     for (const [id, matchId, market, selection, p] of rows) {
-      const res = await env.DB.prepare(
+      stmts.push(env.DB.prepare(
         "INSERT OR REPLACE INTO predictions (id, match_id, market_key, selection_key, probability, fair_odds, model_version, feature_cutoff_at, created_at, data_quality, is_live) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"
-      ).bind(id, matchId, market, selection, Math.round(p * 10000) / 10000, fairOdds(p), MODEL_VERSION, now, now, quality).run();
-      if (res.meta && res.meta.changes) inserted++;
+      ).bind(id, matchId, market, selection, Math.round(p * 10000) / 10000, fairOdds(p), MODEL_VERSION, now, now, quality));
     }
   }
+  const inserted = await batchRun(env, stmts);
   return { ok: true, matches: results.length, predictions_inserted: inserted, model_version: MODEL_VERSION, note: quality };
 }
 
@@ -254,21 +273,21 @@ async function syncFixtures(env) {
   const body = await r.json();
   const list = Array.isArray(body.data) ? body.data : [];
   const now = new Date().toISOString();
-  let teams = 0, matches = 0;
+  const teamStmts = [], matchStmts = [];
   for (const m of list) {
     if (!m.id || !m.team1Id || !m.team2Id) continue;
     for (const [tid, tname] of [[m.team1Id, m.team1Name], [m.team2Id, m.team2Name]]) {
       if (!tname) continue;
-      const res = await env.DB.prepare(
+      teamStmts.push(env.DB.prepare(
         "INSERT OR IGNORE INTO teams (id, provider_team_id, name, updated_at) VALUES (?, ?, ?, ?)"
-      ).bind(tid, tid, tname, now).run();
-      if (res.meta && res.meta.changes) teams++;
+      ).bind(tid, tid, tname, now));
     }
-    const res = await env.DB.prepare(
+    matchStmts.push(env.DB.prepare(
       "INSERT OR REPLACE INTO matches (id, provider_match_id, tournament, team1_id, team2_id, starts_at, status, best_of, source_updated_at, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(m.id, m.id, m.eventName || null, m.team1Id, m.team2Id, m.startsAt || null, m.status || "upcoming", m.bestOf || null, now, JSON.stringify(m)).run();
-    if (res.meta && res.meta.changes) matches++;
+    ).bind(m.id, m.id, m.eventName || null, m.team1Id, m.team2Id, m.startsAt || null, m.status || "upcoming", m.bestOf || null, now, JSON.stringify(m)));
   }
+  const teams = await batchRun(env, teamStmts);
+  const matches = await batchRun(env, matchStmts);
   const usage = await logCall(env, 1);
   let predictions = null;
   try { predictions = await generatePredictions(env); } catch (e) { predictions = { ok: false, reason: "predictions_error" }; }
@@ -291,12 +310,22 @@ async function syncResults(env) {
   const sampleKeys = list.length ? Object.keys(list[0]) : [];
   let matched = 0, recorded = 0, eloUpdates = 0, skippedNoWinner = 0, alreadyDone = 0;
   const eloMoves = [];
+  // One query for all tracked matches (was one round-trip per recent item).
+  const trackedMap = {};
+  const ids = list.filter((m) => m.id).map((m) => m.id);
+  if (ids.length) {
+    const ph = ids.map(() => "?").join(",");
+    const { results: trackedRows } = await env.DB.prepare(
+      `SELECT id, team1_id, team2_id, status FROM matches WHERE id IN (${ph})`
+    ).bind(...ids).all();
+    for (const r of trackedRows) trackedMap[r.id] = r;
+  }
+  const eloMap = await getEloMap(env);
+  const writeStmts = [];
   for (const m of list) {
     if (!m.id) continue;
     // Only process matches we already track in D1.
-    const tracked = await env.DB.prepare(
-      "SELECT id, team1_id, team2_id, status FROM matches WHERE id=?"
-    ).bind(m.id).first();
+    const tracked = trackedMap[m.id];
     if (!tracked) continue;
     matched++;
     if (tracked.status === "completed") { alreadyDone++; continue; }
@@ -304,15 +333,17 @@ async function syncResults(env) {
     if (!winner || (winner !== tracked.team1_id && winner !== tracked.team2_id)) { skippedNoWinner++; continue; }
     const loser = winner === tracked.team1_id ? tracked.team2_id : tracked.team1_id;
     const completedAt = m.completedAt || m.endedAt || m.updatedAt || now;
-    await env.DB.prepare(
+    writeStmts.push(env.DB.prepare(
       "INSERT OR IGNORE INTO results (match_id, winner_team_id, final_score, completed_at, source) VALUES (?, ?, ?, ?, 'cito-recent')"
-    ).bind(m.id, winner, score, completedAt).run();
-    await env.DB.prepare("UPDATE matches SET status='completed' WHERE id=?").bind(m.id).run();
-    const move = await applyEloResult(env, winner, loser, forfeit ? K_FORFEIT : K_PLAYED);
+    ).bind(m.id, winner, score, completedAt));
+    writeStmts.push(env.DB.prepare("UPDATE matches SET status='completed' WHERE id=?").bind(m.id));
+    const move = eloMove(env, eloMap, winner, loser, forfeit ? K_FORFEIT : K_PLAYED, now);
+    writeStmts.push(...move.stmts);
     eloUpdates++;
-    eloMoves.push({ match_id: m.id, winner, score, forfeit, ...move });
+    eloMoves.push({ match_id: m.id, winner, score, forfeit, winner_elo_before: move.winner_elo_before, winner_elo_after: move.winner_elo_after, loser_elo_before: move.loser_elo_before, loser_elo_after: move.loser_elo_after });
     recorded++;
   }
+  await batchRun(env, writeStmts);
   const usage = await logCall(env, 1);
   let predictions = null;
   try { predictions = await generatePredictions(env); } catch (e) { predictions = { ok: false, reason: "predictions_error" }; }
